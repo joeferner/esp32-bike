@@ -2,26 +2,36 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 #include "secrets.h"
 #include "page.h"
 
-const int PIN = 3;  // D1 on XIAO ESP32C3
+const int PIN = 3;  // D1 on XIAO ESP32C3 (must be GPIO0-5 to wake from deep sleep)
 const int BAT_PIN = 4;  // D2 on XIAO ESP32C3 (must be ADC1: GPIO0-4), 100k/100k divider from BAT+
+const unsigned long SLEEP_AFTER_MS = 5 * 60 * 1000;  // no pedalling for this long -> deep sleep
+// The USB port disappears while asleep: pedal to wake it (or hold BOOT while plugging in) to upload.
+const uint32_t WAKE_REVS = 2;               // revs needed after waking to stay awake...
+const unsigned long WAKE_WINDOW_MS = 10000;  // ...within this long, else back to sleep
 volatile unsigned long lastPulse = 0, period = 0;
-volatile uint32_t pulses = 0, glitches = 0;
 
 WebServer server(80);
 
 // Updated once a second in loop(), read by the web handlers
-float rpm = 0, maxRpm = 0, vbat = 0;
+float rpm = 0, vbat = 0;
 bool onUsb = false;
-unsigned long rideMs = 0, lastTick = 0;
-uint32_t revsAtReset = 0, tick = 0;
+unsigned long lastTick = 0;
+
+// Ride stats live in RTC memory so they survive deep sleep (cleared on power-up or reset)
+RTC_DATA_ATTR volatile uint32_t pulses = 0, glitches = 0;
+RTC_DATA_ATTR float maxRpm = 0;
+RTC_DATA_ATTR unsigned long rideMs = 0;
+RTC_DATA_ATTR uint32_t revsAtReset = 0, tick = 0;
 
 // One RPM sample per second for the graph
 const int HIST_LEN = 300;
-uint16_t hist[HIST_LEN];
-int histHead = 0, histCount = 0;
+RTC_DATA_ATTR uint16_t hist[HIST_LEN];
+RTC_DATA_ATTR int histHead = 0, histCount = 0;
 
 float readBatteryVolts() {
   uint32_t mv = 0;
@@ -51,6 +61,31 @@ void IRAM_ATTR onPulse() {
   }
   lastPulse = now;
   pulses++;
+}
+
+void goToSleep() {
+  Serial.println("No pedalling, going to deep sleep");
+  Serial.flush();
+  // Wake when the pin leaves its current level, since the magnet may have stopped on the sensor
+  bool low = digitalRead(PIN) == LOW;
+  esp_deep_sleep_enable_gpio_wakeup(BIT(PIN), low ? ESP_GPIO_WAKEUP_GPIO_HIGH : ESP_GPIO_WAKEUP_GPIO_LOW);
+  gpio_pullup_en((gpio_num_t)PIN);  // keep the pull-up while asleep
+  gpio_pulldown_dis((gpio_num_t)PIN);
+  esp_deep_sleep_start();
+}
+
+// After the sensor wakes us, stay awake only if pedalling continues
+void confirmWake() {
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_GPIO) return;
+  uint32_t before = pulses;
+  pulses++;  // the rev that woke us happened before the interrupt was attached
+  lastPulse = millis() - 5000;  // treat the next pulse as the first after a stop
+  while (millis() < WAKE_WINDOW_MS) {
+    if (pulses - before > WAKE_REVS) return;
+    delay(10);
+  }
+  pulses = before;  // false alarm (bike bumped), don't count it
+  goToSleep();
 }
 
 uint32_t rideRevs() { return pulses - revsAtReset; }
@@ -93,6 +128,7 @@ void setup() {
   pinMode(PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN), onPulse, FALLING);
   analogSetPinAttenuation(BAT_PIN, ADC_11db);  // full range, ~2.1V max at the pin
+  confirmWake();  // before WiFi, so a false wake costs little power
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("bike");
@@ -129,6 +165,8 @@ void loop() {
   // Detects a USB host (SOF frames), not a dumb wall charger. VBUS isn't wired to a GPIO on the XIAO.
   // On USB the charger drives BAT+ toward 4.2V, so the reading isn't the true battery level.
   onUsb = Serial.isPlugged();
+  unsigned long idleMs = now - lastPulse;
+  if (idleMs > SLEEP_AFTER_MS) goToSleep();
 
   static wl_status_t lastStatus = WL_IDLE_STATUS;
   if (WiFi.status() != lastStatus) {
@@ -139,6 +177,7 @@ void loop() {
 
   Serial.printf("RPM: %.1f  Avg: %.1f  Max: %.1f  Revs: %lu  Ride: %lus  Glitches: %lu  RSSI: %d  Battery: %.2fV ",
                 rpm, avgRpm(), maxRpm, rideRevs(), rideMs / 1000, glitches, WiFi.RSSI(), vbat);
-  if (onUsb) Serial.println("(on USB, charging/no battery)");
-  else Serial.printf("(%d%%)\n", batteryPercent(vbat));
+  if (onUsb) Serial.print("(on USB, charging/no battery)");
+  else Serial.printf("(%d%%)", batteryPercent(vbat));
+  Serial.printf("  Sleep in: %lus\n", idleMs < SLEEP_AFTER_MS ? (SLEEP_AFTER_MS - idleMs) / 1000 : 0);
 }
