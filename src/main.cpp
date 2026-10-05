@@ -33,6 +33,46 @@ const int HIST_LEN = 300;
 RTC_DATA_ATTR uint16_t hist[HIST_LEN];
 RTC_DATA_ATTR int histHead = 0, histCount = 0;
 
+// Diagnostics survive crashes, watchdog and brownout resets (not power loss) so a drop can be
+// investigated afterwards via /data. NOINIT memory is garbage on power-up, hence the magic.
+const uint32_t DIAG_MAGIC = 0xB1CE0001;
+RTC_NOINIT_ATTR struct {
+  uint32_t magic, boots, disconnects;
+  uint16_t lastReason;
+} diag;
+esp_reset_reason_t resetReason;
+volatile bool gotIp = false;
+const unsigned long WIFI_RETRY_MS = 15000;  // still disconnected after this long -> restart the connection
+
+const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "poweron";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    default: return "other";
+  }
+}
+
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    diag.disconnects++;
+    diag.lastReason = info.wifi_sta_disconnected.reason;
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    gotIp = true;  // mDNS is restarted from loop(), not from the WiFi event task
+  }
+}
+
+void startMdns() {
+  MDNS.end();
+  MDNS.begin("bike");  // http://bike.local
+  MDNS.addService("http", "tcp", 80);
+}
+
 float readBatteryVolts() {
   uint32_t mv = 0;
   for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(BAT_PIN);
@@ -92,12 +132,14 @@ uint32_t rideRevs() { return pulses - revsAtReset; }
 float avgRpm() { return rideMs ? rideRevs() * 60000.0f / rideMs : 0; }
 
 void handleData() {
-  char json[256];
+  char json[448];
   snprintf(json, sizeof(json),
            "{\"tick\":%lu,\"rpm\":%.1f,\"avgRpm\":%.1f,\"maxRpm\":%.1f,\"revs\":%lu,\"rideSec\":%lu,"
-           "\"vbat\":%.2f,\"batPct\":%d,\"onUsb\":%s,\"rssi\":%d}",
+           "\"vbat\":%.2f,\"batPct\":%d,\"onUsb\":%s,\"rssi\":%d,"
+           "\"uptimeSec\":%lu,\"resetReason\":\"%s\",\"boots\":%lu,\"disconnects\":%lu,\"lastDiscReason\":%u}",
            tick, rpm, avgRpm(), maxRpm, rideRevs(), rideMs / 1000,
-           vbat, batteryPercent(vbat), onUsb ? "true" : "false", WiFi.RSSI());
+           vbat, batteryPercent(vbat), onUsb ? "true" : "false", WiFi.RSSI(),
+           millis() / 1000, resetReasonName(resetReason), diag.boots, diag.disconnects, diag.lastReason);
   server.send(200, "application/json", json);
 }
 
@@ -130,12 +172,19 @@ void setup() {
   analogSetPinAttenuation(BAT_PIN, ADC_11db);  // full range, ~2.1V max at the pin
   confirmWake();  // before WiFi, so a false wake costs little power
 
+  resetReason = esp_reset_reason();
+  if (diag.magic != DIAG_MAGIC) diag = {DIAG_MAGIC, 0, 0, 0};
+  diag.boots++;
+  Serial.printf("Boot #%lu, reset reason: %s\n", diag.boots, resetReasonName(resetReason));
+
   WiFi.mode(WIFI_STA);
   WiFi.setHostname("bike");
   WiFi.setAutoReconnect(true);
+  WiFi.onEvent(onWiFiEvent);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  MDNS.begin("bike");  // http://bike.local
-  MDNS.addService("http", "tcp", 80);
+  // Full TX power on the XIAO C3 causes current spikes that can brown out on battery and
+  // often makes the connection worse, not better
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
   server.on("/", [] { server.send_P(200, "text/html", PAGE); });
   server.on("/data", handleData);
@@ -148,13 +197,23 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  if (gotIp) {
+    gotIp = false;
+    startMdns();  // mDNS doesn't survive a reconnect on its own
+    Serial.printf("WiFi connected: http://%s (http://bike.local)\n", WiFi.localIP().toString().c_str());
+  }
+
+  if (millis() - lastTick < 1000) return;
+  // Snapshot the ISR's values, then read the clock, so a pulse mid-calculation can't put
+  // lastPulse after `now` (the unsigned subtraction would wrap and trigger an instant sleep)
+  // or zero period between the check and the divide.
+  unsigned long last = lastPulse, per = period;
   unsigned long now = millis();
-  if (now - lastTick < 1000) return;
-  bool stopped = now - lastPulse > 3000 || period == 0;
+  bool stopped = now - last > 3000 || per == 0;
   if (!stopped) rideMs += now - lastTick;
   lastTick = now;
 
-  rpm = stopped ? 0.0 : 60000.0 / period;
+  rpm = stopped ? 0.0 : 60000.0 / per;
   if (rpm > maxRpm) maxRpm = rpm;
   hist[histHead] = (uint16_t)(rpm + 0.5f);
   histHead = (histHead + 1) % HIST_LEN;
@@ -165,14 +224,26 @@ void loop() {
   // Detects a USB host (SOF frames), not a dumb wall charger. VBUS isn't wired to a GPIO on the XIAO.
   // On USB the charger drives BAT+ toward 4.2V, so the reading isn't the true battery level.
   onUsb = Serial.isPlugged();
-  unsigned long idleMs = now - lastPulse;
+  unsigned long idleMs = now - last;
   if (idleMs > SLEEP_AFTER_MS) goToSleep();
 
   static wl_status_t lastStatus = WL_IDLE_STATUS;
-  if (WiFi.status() != lastStatus) {
-    lastStatus = WiFi.status();
-    if (lastStatus == WL_CONNECTED) Serial.printf("WiFi connected: http://%s (http://bike.local)\n", WiFi.localIP().toString().c_str());
-    else Serial.printf("WiFi status: %d\n", lastStatus);
+  static unsigned long disconnectedSince = 0;
+  wl_status_t status = WiFi.status();
+  if (status != lastStatus) {
+    lastStatus = status;
+    if (status != WL_CONNECTED) Serial.printf("WiFi status: %d (last disconnect reason: %u)\n", status, diag.lastReason);
+  }
+  // Auto-reconnect sometimes gives up after certain disconnect reasons, so kick it ourselves
+  if (status == WL_CONNECTED) {
+    disconnectedSince = 0;
+  } else if (!disconnectedSince) {
+    disconnectedSince = now;
+  } else if (now - disconnectedSince > WIFI_RETRY_MS) {
+    Serial.println("WiFi still down, restarting connection");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    disconnectedSince = now;
   }
 
   Serial.printf("RPM: %.1f  Avg: %.1f  Max: %.1f  Revs: %lu  Ride: %lus  Glitches: %lu  RSSI: %d  Battery: %.2fV ",

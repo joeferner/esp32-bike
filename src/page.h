@@ -5,6 +5,7 @@
 const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Bike</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32' fill='none' stroke='%232563eb' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><circle cx='7' cy='21' r='5.5'/><circle cx='25' cy='21' r='5.5'/><path d='M7 21h8l-4-9h10M15 21l6-9 4 9M9 9h5M19 8h3l-1 4'/></svg>">
 <style>
 :root{--bg:#f4f4f5;--card:#fff;--fg:#18181b;--mute:#71717a;--accent:#2563eb;--low:#dc2626}
 @media (prefers-color-scheme:dark){:root{--bg:#09090b;--card:#18181b;--fg:#fafafa;--mute:#a1a1aa;--accent:#60a5fa;--low:#f87171}}
