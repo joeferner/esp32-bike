@@ -28,9 +28,14 @@ main{max-width:560px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
 .s{color:var(--mute);font-size:13px;margin-top:2px;font-variant-numeric:tabular-nums}
 canvas{display:block;width:100%;height:140px;margin-top:6px}
 .actions{display:flex;gap:12px}
+#sleepin{color:var(--low);margin-right:4px;font-variant-numeric:tabular-nums}
+#asleep{text-align:center;padding:20px 16px;border:1px solid var(--accent)}
+#asleep .v{font-size:1.4em}
+[hidden]{display:none!important}
 button{flex:1;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--mute);background:transparent;color:var(--fg)}
 </style></head><body>
 <header><span>Bike</span><span class="status">
+<span id="sleepin" hidden></span>
 <span id="rssi"></span>
 <svg id="wifi" viewBox="0 0 24 18" width="20" height="15"><circle cx="12" cy="15.5" r="1.8"/>
 <path d="M8.46 12.46A5 5 0 0 1 15.54 12.46"/><path d="M5.64 9.64A9 9 0 0 1 18.36 9.64"/><path d="M2.81 6.81A13 13 0 0 1 21.19 6.81"/></svg>
@@ -38,6 +43,7 @@ button{flex:1;font:inherit;padding:10px;border-radius:10px;border:1px solid var(
 <rect x="24.5" y="4" width="2" height="5" rx="1"/><rect id="bfill" x="2.5" y="2.5" height="8" rx="1.5" width="0"/></svg>
 <span id="bpct"></span></span></header>
 <main>
+<div class="tile" id="asleep" hidden><div class="v">Bike is asleep</div><div class="l">Pedal to wake it up</div></div>
 <div class="row">
  <div class="tile"><div class="v" id="spd">-</div><div class="l">Speed (mph)</div><div class="s" id="avgspd"></div></div>
  <div class="tile"><div class="v" id="rpm">-</div><div class="l">RPM</div></div>
@@ -57,7 +63,7 @@ const C=2.105, N=300; // wheel circumference in m (700x25c), graph samples
 const MI=1609.344; // m per mile
 const GEAR=1.65; // virtual gear: wheel revs per crank rev (~9.5 mph at 73 RPM)
 const $=id=>document.getElementById(id);
-let hist=[], lastTick=-1, last=null;
+let hist=[], lastTick=-1, last=null, asleep=false;
 
 const speed=r=>r*GEAR*C*60/MI; // mph
 const fmtTime=s=>{const h=Math.floor(s/3600),m=Math.floor(s/60)%60,x=s%60;
@@ -82,8 +88,11 @@ function render(){
 function setStatus(d){
   const bars=!d?0:d.rssi>-55?4:d.rssi>-65?3:d.rssi>-75?2:d.rssi>-85?1:0;
   [...$('wifi').children].forEach((e,i)=>e.classList.toggle('off',i>=bars));
-  $('rssi').textContent=d?d.rssi+' dBm':'offline';
+  $('rssi').textContent=d?d.rssi+' dBm':asleep?'asleep':'offline';
+  $('asleep').hidden=!asleep;
+  $('sleepin').hidden=!d||asleep||d.sleepSec>=60;
   if(!d)return;
+  $('sleepin').textContent='Sleeping in '+d.sleepSec+'s';
   $('bfill').setAttribute('width',d.onUsb?18:18*d.batPct/100);
   $('batt').classList.toggle('low',!d.onUsb&&d.batPct<20);
   $('bpct').textContent=d.onUsb?'USB':d.batPct+'%';
@@ -114,11 +123,16 @@ async function loadHist(){
 
 async function poll(){
   try{
-    const d=await (await fetch('/data')).json();
+    // Time out quickly: a sleeping board never answers, and the default timeout is minutes
+    const d=await (await fetch('/data',{signal:AbortSignal.timeout(3000)})).json();
     if(d.tick===lastTick+1){hist.push(Math.round(d.rpm)); if(hist.length>N)hist.shift(); lastTick=d.tick}
     else if(d.tick!==lastTick) await loadHist();
-    last=d; render();
-  }catch(e){setStatus(null); document.title='Offline · Bike'}
+    asleep=d.sleepSec<=1; last=d; render();
+  }catch(e){
+    // Gone right when the countdown ran out: it went to sleep rather than dropping off WiFi
+    if(last&&last.sleepSec<=5)asleep=true;
+    setStatus(null); document.title=(asleep?'Asleep':'Offline')+' · Bike';
+  }
   setTimeout(poll,1000);
 }
 

@@ -13,6 +13,7 @@ const unsigned long SLEEP_AFTER_MS = 5 * 60 * 1000;  // no pedalling for this lo
 // The USB port disappears while asleep: pedal to wake it (or hold BOOT while plugging in) to upload.
 const uint32_t WAKE_REVS = 2;               // revs needed after waking to stay awake...
 const unsigned long WAKE_WINDOW_MS = 10000;  // ...within this long, else back to sleep
+const uint64_t PARKED_POLL_US = 5000000;     // asleep with the magnet on the sensor: check this often
 volatile unsigned long lastPulse = 0, period = 0;
 
 WebServer server(80);
@@ -103,19 +104,30 @@ void IRAM_ATTR onPulse() {
   pulses++;
 }
 
-void goToSleep() {
-  Serial.println("No pedalling, going to deep sleep");
-  Serial.flush();
-  // Wake when the pin leaves its current level, since the magnet may have stopped on the sensor
-  bool low = digitalRead(PIN) == LOW;
-  esp_deep_sleep_enable_gpio_wakeup(BIT(PIN), low ? ESP_GPIO_WAKEUP_GPIO_HIGH : ESP_GPIO_WAKEUP_GPIO_LOW);
-  gpio_pullup_en((gpio_num_t)PIN);  // keep the pull-up while asleep
-  gpio_pulldown_dis((gpio_num_t)PIN);
+void goToSleep(bool log = true) {
+  if (log) {
+    Serial.println("No pedalling, going to deep sleep");
+    Serial.flush();
+  }
+  if (digitalRead(PIN) == HIGH) {
+    // IDF puts a pull-up on LOW-wake pins during deep sleep, so the reed switch closing wakes us
+    esp_deep_sleep_enable_gpio_wakeup(BIT(PIN), ESP_GPIO_WAKEUP_GPIO_LOW);
+  } else {
+    // Magnet stopped on the sensor. Waking on HIGH can't work: IDF forces a pull-down on HIGH-wake
+    // pins during deep sleep and the reed switch can only pull to ground, so it would never wake.
+    // Poll with a timer until the magnet moves off, then sleep waiting for the next LOW.
+    gpio_pullup_dis((gpio_num_t)PIN);  // don't burn current through the closed switch meanwhile
+    esp_sleep_enable_timer_wakeup(PARKED_POLL_US);
+  }
   esp_deep_sleep_start();
 }
 
 // After the sensor wakes us, stay awake only if pedalling continues
 void confirmWake() {
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+    delayMicroseconds(100);  // let the pull-up settle
+    goToSleep(false);        // parked-magnet poll: re-arm based on where the magnet is now
+  }
   if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_GPIO) return;
   uint32_t before = pulses;
   pulses++;  // the rev that woke us happened before the interrupt was attached
@@ -129,6 +141,12 @@ void confirmWake() {
 }
 
 uint32_t rideRevs() { return pulses - revsAtReset; }
+
+unsigned long sleepInSec() {
+  unsigned long last = lastPulse;  // snapshot before reading the clock, see loop()
+  unsigned long idleMs = millis() - last;
+  return idleMs < SLEEP_AFTER_MS ? (SLEEP_AFTER_MS - idleMs) / 1000 : 0;
+}
 float avgRpm() { return rideMs ? rideRevs() * 60000.0f / rideMs : 0; }
 
 void handleData() {
@@ -136,9 +154,10 @@ void handleData() {
   snprintf(json, sizeof(json),
            "{\"tick\":%lu,\"rpm\":%.1f,\"avgRpm\":%.1f,\"maxRpm\":%.1f,\"revs\":%lu,\"rideSec\":%lu,"
            "\"vbat\":%.2f,\"batPct\":%d,\"onUsb\":%s,\"rssi\":%d,"
+           "\"sleepSec\":%lu,"
            "\"uptimeSec\":%lu,\"resetReason\":\"%s\",\"boots\":%lu,\"disconnects\":%lu,\"lastDiscReason\":%u}",
            tick, rpm, avgRpm(), maxRpm, rideRevs(), rideMs / 1000,
-           vbat, batteryPercent(vbat), onUsb ? "true" : "false", WiFi.RSSI(),
+           vbat, batteryPercent(vbat), onUsb ? "true" : "false", WiFi.RSSI(), sleepInSec(),
            millis() / 1000, resetReasonName(resetReason), diag.boots, diag.disconnects, diag.lastReason);
   server.send(200, "application/json", json);
 }
