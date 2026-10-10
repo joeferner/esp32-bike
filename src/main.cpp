@@ -9,6 +9,9 @@
 
 const int PIN = 3;  // D1 on XIAO ESP32C3 (must be GPIO0-5 to wake from deep sleep)
 const int BAT_PIN = 4;  // D2 on XIAO ESP32C3 (must be ADC1: GPIO0-4), 100k/100k divider from BAT+
+// Corrects ADC and resistor tolerance: set to (multimeter volts at the battery) / (volts the page shows),
+// measured on battery power so it also covers the drop under load. 4.15V metered / 4.08V read.
+const float BAT_CAL = 1.017f;
 const unsigned long SLEEP_AFTER_MS = 5 * 60 * 1000;  // no pedalling for this long -> deep sleep
 // The USB port disappears while asleep: pedal to wake it (or hold BOOT while plugging in) to upload.
 const uint32_t WAKE_REVS = 2;               // revs needed after waking to stay awake...
@@ -77,12 +80,19 @@ void startMdns() {
 float readBatteryVolts() {
   uint32_t mv = 0;
   for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(BAT_PIN);
-  return (mv / 16.0f) * 2.0f / 1000.0f;  // x2 to undo the divider
+  return (mv / 16.0f) * 2.0f / 1000.0f * BAT_CAL;  // x2 to undo the divider
 }
 
 int batteryPercent(float v) {
-  // Rough linear LiPo estimate: 3.3V = 0%, 4.2V = 100%
-  return constrain((int)((v - 3.3f) / (4.2f - 3.3f) * 100.0f), 0, 100);
+  // Typical LiPo discharge curve, interpolated. Top is 4.15V, not 4.2V: the charger stops at ~4.2V
+  // and the cell settles to ~4.15V once charging ends.
+  static const float volts[] = {3.30f, 3.61f, 3.69f, 3.73f, 3.77f, 3.82f, 3.87f, 3.98f, 4.08f, 4.15f};
+  static const int pct[]     = {0,     5,     10,    20,    30,    45,    60,    75,    90,    100};
+  const int n = sizeof(pct) / sizeof(pct[0]);
+  if (v <= volts[0]) return 0;
+  for (int i = 1; i < n; i++)
+    if (v < volts[i]) return pct[i - 1] + (v - volts[i - 1]) / (volts[i] - volts[i - 1]) * (pct[i] - pct[i - 1]);
+  return 100;
 }
 
 void IRAM_ATTR onPulse() {

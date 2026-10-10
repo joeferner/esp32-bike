@@ -28,6 +28,7 @@ main{max-width:560px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
 .s{color:var(--mute);font-size:13px;margin-top:2px;font-variant-numeric:tabular-nums}
 canvas{display:block;width:100%;height:140px;margin-top:6px}
 .actions{display:flex;gap:12px}
+#volts{margin-left:2px;font-variant-numeric:tabular-nums}
 #sleepin{color:var(--low);margin-right:4px;font-variant-numeric:tabular-nums}
 #asleep{text-align:center;padding:20px 16px;border:1px solid var(--accent)}
 #asleep .v{font-size:1.4em}
@@ -41,7 +42,7 @@ button{flex:1;font:inherit;padding:10px;border-radius:10px;border:1px solid var(
 <path d="M8.46 12.46A5 5 0 0 1 15.54 12.46"/><path d="M5.64 9.64A9 9 0 0 1 18.36 9.64"/><path d="M2.81 6.81A13 13 0 0 1 21.19 6.81"/></svg>
 <svg id="batt" viewBox="0 0 27 13" width="27" height="13"><rect x=".75" y=".75" width="22.5" height="11.5" rx="3" fill="none" stroke="currentColor" stroke-width="1.5"/>
 <rect x="24.5" y="4" width="2" height="5" rx="1"/><rect id="bfill" x="2.5" y="2.5" height="8" rx="1.5" width="0"/></svg>
-<span id="bpct"></span></span></header>
+<span id="bpct"></span><span id="volts"></span></span></header>
 <main>
 <div class="tile" id="asleep" hidden><div class="v">Bike is asleep</div><div class="l">Pedal to wake it up</div></div>
 <div class="row">
@@ -96,6 +97,7 @@ function setStatus(d){
   $('bfill').setAttribute('width',d.onUsb?18:18*d.batPct/100);
   $('batt').classList.toggle('low',!d.onUsb&&d.batPct<20);
   $('bpct').textContent=d.onUsb?'USB':d.batPct+'%';
+  $('volts').textContent=d.vbat.toFixed(2)+'V';
 }
 
 function draw(){
